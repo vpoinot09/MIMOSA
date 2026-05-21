@@ -4,6 +4,6 @@ This repository contains R Scripts and supplementary materials for MIMOSA for th
 - RNA_seq_humain_MIMOSA260316.html: R script used for host datas 
 - RNA_seq_microbes_MIMOSA260316.html : R script used for microbial datas
 - RNA_seq_mofa_MIMOSA260316.html : R script used for multi-omic integration, UMAP dimension reduction and clustering
-- Supplementary_material.pdf : 1 table
+- Supplementary_material.pdf : 1 table and 1 figure with additional content 
 ## Contact
 For any questions regarding this code, please contact Poinot Valentine at valentine.poinot@etu.univ-lyon1.fr.
