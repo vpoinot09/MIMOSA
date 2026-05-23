@@ -1,0 +1,928 @@
+---
+title: "Analyse de la Diversité et de la Composition Taxonomique du Microbiote + préparation MOFA"
+output: html_document
+date: "2026-04-03"
+editor_options: 
+  chunk_output_type: console
+---
+PIPELINE DE TRAITEMENT DU MICROBIOTE (VIRUS, BACTÉRIES, EUCARYOTES)
+Étapes : Nettoyage taxonomique, Décontamination basée sur les contrôles négatifs,
+Normalisation RPKM, Raréfaction, et Visualisations Cliniques.
+```{r, setup, include=FALSE}
+
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(vegan)
+library(tidyverse)
+library(ggrepel)
+library(tidytext) 
+library(ggtext)
+```
+
+# 1. FONCTIONS DE NETTOYAGE ET D'ASSIGNATION TAXONOMIQUE
+```{r}
+
+
+# Fonction pour évaluer la validité d'un rang taxonomique (exclusion des taxons non assignés)
+is_valid_tax <- function(x) {
+  !is.na(x) & x != "" & x != "__" & !str_detect(str_to_lower(x), "unknown|unassigned|unclassified|^$")
+}
+
+# Fonction globale de traitement de la taxonomie
+# Rationale : Les assignations métagénomiques sont souvent incomplètes. Cette fonction 
+# utilise une logique "en cascade" pour remonter au rang parent le plus précis disponible.
+apply_taxonomy_rules <- function(df) {
+  df %>%
+    separate(
+      taxonomy, 
+      into = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), 
+      sep = ";\\s*", remove = FALSE, fill = "right"
+    ) %>%
+    mutate(across(c(Kingdom, Phylum, Class, Order, Family, Genus, Species), str_trim)) %>%
+    # Remplacement des taxons invalides par des valeurs manquantes (NA)
+    mutate(across(c(Kingdom, Phylum, Class, Order, Family, Genus, Species), ~ ifelse(is_valid_tax(.x), .x, NA_character_))) %>%
+    mutate(
+      # 1. RÈGLE EN CASCADE : Attribution du nom le plus précis disponible
+      Nom_Cascade = case_when(
+        !is.na(Species) ~ Species,
+        !is.na(Genus) ~ paste(Genus),
+        !is.na(Family) ~ paste(Family, "unc."),
+        !is.na(Order) ~ paste(Order, "unc."),
+        !is.na(Class) ~ paste(Class, "unc."),
+        !is.na(Phylum) ~ paste(Phylum, "unc."),
+        !is.na(Kingdom) ~ paste(Kingdom, "unc."),
+        TRUE ~ "Unassigned"
+      ),
+      
+      # 2. RÈGLE D'AGRÉGATION FINALE
+      # Rationale : Pour les bactéries et eucaryotes, l'assignation à l'espèce est souvent 
+      # incertaine. L'agrégation est bloquée au niveau du Genre pour plus de robustesse.
+      # Les virus conservent leur résolution maximale.
+      Niveau_Agregation = case_when(
+        Kingdom %in% c("Bacteria", "Eukaryota") & !is.na(Genus) ~ paste(Genus),
+        TRUE ~ Nom_Cascade
+      ),
+      
+      # 3. CRÉATION DES TAGS DE RÈGNE POUR LA VISUALISATION
+      Regne_Tag = case_when(
+        Kingdom == "Bacteria" ~ " _Bac",
+        Kingdom == "Eukaryota" ~ " _Euk",
+        Kingdom == "Viruses" ~ " _Vir",
+        TRUE ~ ""
+      ),
+      
+      Taxon_Precis = paste0(Nom_Cascade, Regne_Tag),
+      Taxon_Agrege = paste0(Niveau_Agregation, Regne_Tag)
+    ) %>%
+    # Exclusion stricte des séquences sans aucune assignation valide
+    filter(Nom_Cascade != "Unassigned")
+}
+```
+
+# 2. IMPORTATION ET DÉCONTAMINATION DES DONNÉES (FILTRES DE BRUIT ET TÉMOINS)
+```{r}
+
+
+counts_global <- read.table("counts_All.txt", header = TRUE, sep = "\t", check.names = FALSE)
+total_reads_ref <- read.table("Total_reads_MIMOSA2.0.txt", header = TRUE, sep = "\t", check.names = FALSE)
+
+# Uniformisation de la nomenclature des échantillons
+clean_name <- function(name) {
+  name %>% str_remove("^Plrevelo-") %>% str_remove("_S\\d+(-counts)?$")
+}
+
+colnames(counts_global) <- ifelse(colnames(counts_global) == "OTU_id", "OTU_id", clean_name(colnames(counts_global)))
+
+lib_size <- total_reads_ref %>%
+  pivot_longer(cols = -Sample, names_to = "Sample_Name", values_to = "Total_Reads") %>%
+  mutate(Sample_Name = clean_name(Sample_Name)) %>%
+  dplyr::select(Sample_Name, Total_Reads)
+
+# LISTE NOIRE D'OTUs
+# Ces OTUs ont été identifiés par homologie (BLAST) comme étant des séquences humaines 
+# résiduelles. Ils doivent être exclus des analyses microbiennes.
+otus_a_supprimer <- c(
+  "NODE_156_length_935_cov_4279.180587_g82_i3", "NODE_166_length_915_cov_3711.526559_g82_i5",
+  "NODE_257_length_1381_cov_624.800300_g213_i0", "NODE_372_length_599_cov_866.896364_g239_i0",
+  "NODE_42_length_1368_cov_25992.313116_g38_i0", "NODE_506_length_1017_cov_12150.286157_g446_i0",
+  "NODE_715_length_877_cov_7423.362319_g647_i0", "NODE_355_length_633_cov_24.049658_g348_i0",
+  "NODE_43_length_5819_cov_7401.615771_g0_i28", "NODE_132_length_733_cov_51.321637_g127_i0",
+  "NODE_226_length_786_cov_3278.274084_g220_i0", "NODE_314_length_580_cov_2601.433145_g302_i0",
+  "NODE_376_length_503_cov_2322.640969_g364_i0", "NODE_81_length_686_cov_3724.726845_g78_i0",
+  "NODE_99_length_889_cov_1232.301190_g83_i0", "NODE_366_length_530_cov_23.012474_g365_i0",
+  "NODE_1849_length_506_cov_13.461707_g1757_i0", "NODE_369_length_622_cov_9.420593_g362_i0",
+  "NODE_1080_length_664_cov_5.097561_g993_i0", "NODE_331_length_659_cov_11.196721_g324_i0",
+  "NODE_41_length_1104_cov_94.988626_g16_i1", "NODE_17_length_1500_cov_58.272226_g16_i0",
+  "NODE_198_length_692_cov_2165.659409_g191_i0", "NODE_105_length_7827_cov_635.019157_g0_i20",
+  "NODE_1076_length_742_cov_3146.633478_g994_i0", "NODE_55_length_2621_cov_4.013608_g21_i0"
+)
+
+# FILTRE DE BRUIT DE FOND GLOBAL
+# Rationale : Les comptes extrêmement faibles (< 5 reads) sont considérés comme du bruit 
+# de fond de séquençage (cross-talk, index hopping) et sont ramenés à 0.
+counts_global_filtered <- counts_global
+counts_num_cols <- sapply(counts_global_filtered, is.numeric)
+counts_global_filtered[, counts_num_cols][counts_global_filtered[, counts_num_cols] < 5] <- 0
+
+# DÉCONTAMINATION VIRALE
+virus_tax <- read.table("tax_viral.txt", header = TRUE, sep = "\t", check.names = FALSE)
+
+# Normalisation en RPKM (Reads Per Kilobase per Million mapped reads)
+virus_rpkm_all <- virus_tax %>% 
+  mutate(Contig_Length = as.numeric(str_extract(OTU_id, "(?<=length_)\\d+"))) %>%
+  inner_join(counts_global_filtered, by = "OTU_id") %>%
+  pivot_longer(cols = -c(OTU_id, taxonomy, Contig_Length), names_to = "Sample_Name", values_to = "Counts") %>%
+  inner_join(lib_size, by = "Sample_Name") %>%
+  mutate(RPKM = (Counts / (Contig_Length / 1000)) / (Total_Reads / 1000000)) %>%
+  dplyr::select(OTU_id, taxonomy, Contig_Length, Sample_Name, RPKM) %>%
+  pivot_wider(names_from = Sample_Name, values_from = RPKM)
+
+# Décontamination stringente (Soustraction des témoins négatifs)
+# Rationale : Si l'abondance d'un taxon dans un échantillon clinique est inférieure 
+# ou égale à son abondance maximale dans les témoins négatifs (NT1, NT2), il est considéré 
+# comme un contaminant de laboratoire/réactifs (kitome) et éliminé (mis à 0).
+neg_ctrls <- c("NT1", "NT2")
+patients <- setdiff(colnames(virus_rpkm_all), c("OTU_id", "taxonomy", "Contig_Length", neg_ctrls))
+
+virus_final <- virus_rpkm_all %>%
+  filter(!(OTU_id %in% otus_a_supprimer)) %>%
+  filter(!str_detect(str_to_lower(taxonomy), "retroviridae")) %>% # Exclu car souvent endogènes
+  apply_taxonomy_rules() %>% 
+  rowwise() %>%
+  mutate(max_NT = max(c_across(all_of(neg_ctrls)), na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(across(all_of(patients), ~ ifelse(.x <= max_NT, 0, .x))) %>%
+  filter(rowSums(across(all_of(patients))) > 0) %>%
+  dplyr::select(-max_NT)
+
+
+# DÉCONTAMINATION BACTÉRIES ET EUCARYOTES
+counts_eb_remaining <- counts_global_filtered %>% 
+  filter(!(OTU_id %in% virus_tax$OTU_id))
+
+eb_tax <- read.table("Taxonomie_euk_bac.txt", header = TRUE, sep = "\t", check.names = FALSE, stringsAsFactors = FALSE)
+
+eb_merged <- eb_tax %>%
+  rename(taxonomy = Taxonomie_Definitive) %>%
+  mutate(Contig_Length = as.numeric(str_extract(OTU_id, "(?<=length_)\\d+"))) %>%
+  inner_join(counts_eb_remaining, by = "OTU_id")
+
+eb_rpkm_all <- eb_merged %>%
+  pivot_longer(cols = -c(OTU_id, taxonomy, Contig_Length), names_to = "Sample_Name", values_to = "Counts") %>%
+  inner_join(lib_size, by = "Sample_Name") %>%
+  mutate(RPKM = (Counts / (Contig_Length / 1000)) / (Total_Reads / 1000000)) %>%
+  dplyr::select(OTU_id, taxonomy, Contig_Length, Sample_Name, RPKM) %>%
+  pivot_wider(names_from = Sample_Name, values_from = RPKM)
+
+eb_final <- eb_rpkm_all %>%
+  filter(!(OTU_id %in% otus_a_supprimer)) %>%
+  apply_taxonomy_rules() %>% 
+  filter(!str_detect(Nom_Cascade, "^Eukaryota unc\\.")) %>% # Exclu car trop imprécis
+  rowwise() %>%
+  mutate(max_NT = max(c_across(all_of(neg_ctrls)), na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(across(all_of(patients), ~ ifelse(.x <= max_NT, 0, .x))) %>%
+  filter(rowSums(across(all_of(patients))) > 0) %>%
+  dplyr::select(-max_NT)
+
+bacteria_final <- eb_final %>% filter(str_detect(taxonomy, "Bacteria"))
+eukaryote_final <- eb_final %>% filter(str_detect(taxonomy, "Eukaryota"))
+
+```
+
+# 3. COURBES DE RARÉFACTION (CONTRÔLE DE LA PROFONDEUR DE SÉQUENÇAGE)
+
+```{r}
+
+# Rationale : Les courbes de raréfaction permettent de vérifier si la profondeur de 
+# séquençage est suffisante pour capturer la majorité de la diversité taxonomique 
+# d'un échantillon (atteinte d'un plateau).
+
+patients_rare <- setdiff(colnames(counts_global), c("OTU_id", "NT1", "NT2"))
+
+generate_rarefaction <- function(kingdom_name, otu_list, counts_df) {
+  otu_mat <- counts_df %>%
+    filter(OTU_id %in% otu_list) %>%
+    dplyr::select(OTU_id, all_of(patients_rare)) %>%
+    column_to_rownames("OTU_id")
+  
+  # Filtre : un minimum de 50 reads bruts est requis pour modéliser la raréfaction
+  samples_to_keep <- colnames(otu_mat)[colSums(otu_mat) > 50]
+  if(length(samples_to_keep) == 0) return(NULL) 
+  
+  otu_filtered <- otu_mat[, samples_to_keep, drop = FALSE]
+  
+  get_rare_data <- function(sample_name, otu_tab) {
+    counts <- otu_tab[, sample_name]
+    counts <- counts[counts > 0]
+    if(length(counts) == 0) return(NULL)
+    
+    steps <- unique(round(seq(1, sum(counts), length.out = 50)))
+    richness <- sapply(steps, function(x) suppressWarnings(rarefy(counts, x)))
+    
+    return(data.frame(SampleID = sample_name, Reads = steps, Species = richness))
+  }
+  
+  rare_data_all <- map_dfr(colnames(otu_filtered), ~get_rare_data(.x, otu_filtered))
+  
+  p <- ggplot(rare_data_all, aes(x = Reads, y = Species, color = SampleID)) +
+    geom_line(linewidth = 1) + 
+    facet_wrap(~SampleID, scales = "free", ncol = 4) +
+    scale_x_continuous(labels = scales::comma) + 
+    theme_bw() +
+    theme(legend.position = "none", strip.background = element_rect(fill = "grey20"), 
+          strip.text = element_text(color = "white", size = 8, face = "bold"),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+    labs(title = paste("Raréfaction individuelle :", kingdom_name),
+         x = "Nombre de lectures (Reads bruts)", y = "Nombre d'espèces (OTUs)")
+  return(p)
+}
+
+plot_virome <- generate_rarefaction("Virome", virus_final$OTU_id, counts_global)
+plot_bacteriome <- generate_rarefaction("Bactériome", bacteria_final$OTU_id, counts_global)
+plot_eukaryotes <- generate_rarefaction("Eucaryotes", eukaryote_final$OTU_id, counts_global)
+
+print(plot_eukaryotes)
+print(plot_bacteriome)
+print(plot_virome)
+
+```
+
+# 4. STATISTIQUES DESCRIPTIVES : Z-SCORE ET IDENTIFICATION DU DOMINANT
+```{r, fig.width=14, fig.height=24}
+
+# Rationale : Le calcul du Z-score sur les valeurs RPKM normalise l'abondance d'un taxon 
+# par rapport au profil global de l'échantillon. Un Z-score élevé (> 2) indique un taxon 
+# s'écartant significativement de la moyenne (prolifération/infection dominante).
+
+table_long <- bind_rows(virus_final, eb_final) %>%
+  dplyr::select(-any_of(c("NT1", "NT2"))) %>%
+  pivot_longer(cols = all_of(patients), names_to = "Patient", values_to = "RPKM") %>%
+  filter(RPKM > 0)
+
+table_aggregated <- table_long %>%
+  arrange(desc(RPKM)) %>%
+  group_by(Patient, Niveau_Agregation) %>%
+  summarise(
+    Group_RPKM = sum(RPKM, na.rm = TRUE),
+    Dominant_Name = dplyr::first(Nom_Cascade), 
+    Kingdom = dplyr::first(Kingdom),
+    .groups = "drop"
+  )
+
+table_zscore_patient <- table_aggregated %>%
+  group_by(Patient) %>%
+  mutate(
+    mean_patient = mean(Group_RPKM, na.rm = TRUE),
+    sd_patient = sd(Group_RPKM, na.rm = TRUE),
+    sd_patient = ifelse(sd_patient == 0 | is.na(sd_patient), 1, sd_patient), 
+    z_score_pat = (Group_RPKM - mean_patient) / sd_patient
+  ) %>%
+  ungroup()
+
+dot_plot_zscore <- ggplot(table_zscore_patient, aes(x = Patient, y = Group_RPKM)) +
+  geom_vline(xintercept = unique(table_zscore_patient$Patient), color = "grey90", linetype = "dashed") +
+  geom_point(aes(color = z_score_pat), alpha = 0.7, size = 4) +  
+  scale_color_gradientn(colors = c("lightblue", "orange", "red", "darkred"), name = "Z-score (Dominance)") +
+  scale_y_log10(labels = scales::label_log()) +
+  # Labellisation stricte : Seuls les outliers majeurs sont affichés
+  geom_text_repel(
+    data = subset(table_zscore_patient, z_score_pat > 2 & Group_RPKM > 100), 
+    aes(label = Dominant_Name), size = 4.5, fontface = "bold.italic",
+    direction = "both", nudge_y = 0.3, segment.size = 0.3, max.overlaps = Inf
+  ) +
+  theme_minimal() +
+  labs(title = "Identification des Pathogènes Dominants (Outliers intra-patients)",
+       subtitle = "Agrégation stricte (Famille/Espèce Virus, Genre Bact/Euk)",
+       x = "Échantillons Patients", y = "Abondance absolue (RPKM) - Log10") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12, face = "bold"),
+        legend.position = "right")
+
+print(dot_plot_zscore)
+
+```
+
+# 5. GÉNÉRATION DES MATRICES MAÎTRESSES POUR ANALYSE AVAL
+
+```{r}
+
+# 5.1. Matrice par OTU (Résolution maximale)
+table_master_otu <- bind_rows(virus_final, eb_final) %>%
+  dplyr::select(OTU_id, Taxon_Precis, Taxon_Agrege, all_of(patients))
+
+# 5.2. Matrice agrégée par Taxon (Pour l'étude de composition globale)
+table_master_taxon <- table_master_otu %>%
+  dplyr::select(-OTU_id, -Taxon_Precis) %>%
+  pivot_longer(cols = all_of(patients), names_to = "Patient", values_to = "RPKM") %>%
+  group_by(Patient, Taxon_Agrege) %>%
+  summarise(RPKM_Sum = sum(RPKM, na.rm = TRUE), .groups = "drop") %>%
+  filter(RPKM_Sum > 0) %>%
+  pivot_wider(names_from = Patient, values_from = RPKM_Sum, values_fill = 0)
+
+# 5.3. Matrice globale normalisée pour modèles à variables latentes (ex: MOFA)
+# Rationale : Les modèles multivariés gèrent mal la sparsité. On exclut les taxons 
+# rares (prévalence < 5 patients) et on applique une transformation Log2(x+1).
+patient_cols <- setdiff(colnames(table_master_taxon), "Taxon_Agrege")
+taxons_valides <- table_master_taxon %>%
+  pivot_longer(cols = all_of(patient_cols), names_to = "Patient", values_to = "RPKM") %>%
+  filter(RPKM > 0) %>%
+  group_by(Taxon_Agrege) %>%
+  summarise(Nb_Patients_Positifs = n()) %>%
+  filter(Nb_Patients_Positifs >= 5) %>%
+  pull(Taxon_Agrege)
+
+mat_mofa_microbe <- table_master_taxon %>%
+  filter(Taxon_Agrege %in% taxons_valides) %>%
+  column_to_rownames("Taxon_Agrege") %>%
+  as.matrix() %>%
+  (function(x) log2(x + 1))
+```
+
+# 6. GÉNÉRATION DES MATRICES SECONDAIRES (CHARGES PAR RÈGNE ET DOMINANCES)
+
+```{r}
+# Rationale : Ces matrices capturent des descripteurs globaux de l'écosystème. 
+# Au lieu de regarder chaque espèce, on évalue la "charge" globale de chaque règne 
+# et la force de son pathogène dominant. Ces métriques sont idéales comme variables 
+# d'entrée pour des analyses multivariées (ex: MOFA) ou de survie.
+
+
+# 6.1. Abondance relative du taxon dominant par règne
+# Rationale : Permet de quantifier si un règne est monopolisé par un seul taxon 
+# (forte dominance, typique d'une infection) ou très diversifié.
+
+# 1. Calcul du total RPKM par patient pour définir le dénominateur
+totaux_patients <- table_aggregated %>%
+  group_by(Patient) %>%
+  summarise(Total_RPKM_Patient = sum(Group_RPKM, na.rm = TRUE), .groups = "drop")
+
+# 2. Identification du taxon dominant par Règne ET par Patient
+dominant_per_kingdom <- table_aggregated %>%
+  left_join(totaux_patients, by = "Patient") %>%
+  # Calcul de l'abondance relative (entre 0 et 1) au sein du patient
+  mutate(Relative_Abundance = Group_RPKM / Total_RPKM_Patient) %>%
+  group_by(Patient, Kingdom) %>%
+  slice_max(order_by = Relative_Abundance, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# 3. Formatage en matrice et transformation Log2
+matrice_abondance_dominants <- dominant_per_kingdom %>%
+  mutate(Variable = case_when(
+    Kingdom == "Bacteria" ~ "Abondance_dominant_Bac",
+    Kingdom == "Viruses" ~ "Abondance_dominant_Vir",
+    Kingdom == "Eukaryota" ~ "Abondance_dominant_Euk",
+    TRUE ~ paste0("Abondance_dominant_", tolower(Kingdom))
+  )) %>%
+  dplyr::select(Patient, Variable, Relative_Abundance) %>%
+  pivot_wider(names_from = Patient, values_from = Relative_Abundance, values_fill = 0) %>%
+  column_to_rownames("Variable") %>%
+  as.matrix() %>%
+  (function(x) log2(x + 1))
+
+write.table(matrice_abondance_dominants, "Matrice_Abondance_Dominants_Regne.txt", sep="\t", quote=FALSE, col.names=NA)
+
+
+
+# 6.2. Matrice des charges totales par Règne : Log2(Total RPKM + 1)
+# Rationale : Estime la biomasse relative globale (virale, bactérienne, fongique) 
+# pour chaque patient, indépendamment de la taxonomie détaillée.
+
+# Extraction des données depuis les tables propres (qui contiennent déjà les RPKM et Kingdom)
+matrice_regne <- bind_rows(virus_final, eb_final) %>%
+  dplyr::select(Kingdom, all_of(patient_cols)) %>%
+  pivot_longer(cols = all_of(patient_cols), names_to = "Patient", values_to = "RPKM") %>%
+  group_by(Patient, Kingdom) %>%
+  # Somme de tous les RPKM appartenant au même règne pour un patient donné
+  summarise(Total_RPKM = sum(RPKM, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Patient, values_from = Total_RPKM, values_fill = 0) %>%
+  column_to_rownames("Kingdom") %>%
+  as.matrix()
+
+# Transformation Log2 pour normaliser la distribution des charges
+mat_regne_log2 <- log2(matrice_regne + 1)
+
+write.table(mat_regne_log2, "Matrice_Regne_Patient_Log2.txt", sep="\t", quote=FALSE, col.names=NA)
+```
+
+# 7. CALCULS DE DIVERSITÉ ALPHA (SHANNON & RICHESSE)
+
+```{r}
+
+# Rationale : La diversité est calculée à deux niveaux (OTU et Taxonomie). 
+# L'index de Shannon évalue à la fois la richesse (nombre d'espèces) et 
+# l'équitabilité (répartition des abondances) de la communauté microbienne.
+
+data_base <- bind_rows(virus_final, eb_final) %>%
+  dplyr::select(OTU_id, Taxon_Agrege, Kingdom, all_of(patient_cols)) %>%
+  pivot_longer(cols = all_of(patient_cols), names_to = "Patient", values_to = "RPKM") %>%
+  filter(RPKM > 0)
+
+metrics_taxo <- data_base %>%
+  group_by(Patient, Kingdom, Taxon_Agrege) %>%
+  summarise(RPKM_Sum = sum(RPKM), .groups = "drop") %>%
+  group_by(Patient, Kingdom) %>%
+  summarise(
+    Shannon = vegan::diversity(RPKM_Sum, index = "shannon"),
+    Richness = n_distinct(Taxon_Agrege),
+    .groups = "drop"
+  ) %>%
+  mutate(Type = "Taxo")
+
+metrics_otu <- data_base %>%
+  group_by(Patient, Kingdom) %>%
+  summarise(
+    Shannon = vegan::diversity(RPKM, index = "shannon"),
+    Richness = n_distinct(OTU_id),
+    .groups = "drop"
+  ) %>%
+  mutate(Type = "OTU")
+
+mat_shannon_dual <- bind_rows(metrics_taxo, metrics_otu) %>%
+  mutate(Row_Name = paste0(Kingdom, "_", Type)) %>%
+  dplyr::select(Patient, Row_Name, Shannon) %>%
+  pivot_wider(names_from = Patient, values_from = Shannon, values_fill = 0) %>%
+  column_to_rownames("Row_Name") %>%
+  as.matrix()
+
+```
+
+# 8. VISUALISATIONS CLINIQUES (BARPLOTS ET BUBBLE PLOTS)
+
+```{r, fig.width=14, fig.height=24}
+
+
+# Rationale : L'objectif de ces représentations est de stratifier la cohorte selon
+# le profil d'infection dominant et de mettre en évidence visuellement les pathogènes.
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+
+# Packages requis pour le tri indépendant des barres et le texte en gras
+if (!require("tidytext")) install.packages("tidytext")
+if (!require("ggtext")) install.packages("ggtext")
+library(tidytext) 
+library(ggtext)
+
+# --- PRÉPARATION COMMUNE ---
+table_long_rpkm <- table_master_taxon %>%
+  pivot_longer(cols = -Taxon_Agrege, names_to = "Patient", values_to = "RPKM") %>%
+  filter(RPKM > 0) %>%
+  mutate(Log_RPKM = log10(RPKM + 1)) %>%
+  # Renommage des eucaryotes en Fungi pour plus de clarté clinique
+  mutate(Taxon_Agrege = str_replace(Taxon_Agrege, "_Euk", "_Fun")) %>%
+  filter(!(str_detect(Taxon_Agrege, "_Bac|_Fun") & str_detect(Taxon_Agrege, "unc\\.")))
+
+# Définition des Règnes globaux (utile pour les deux graphiques)
+table_long_rpkm <- table_long_rpkm %>%
+  mutate(
+    Regne = case_when(
+      str_detect(Taxon_Agrege, "Caudoviricetes") ~ "Phage",
+      str_detect(Taxon_Agrege, "_Bac") ~ "Bactéries",
+      str_detect(Taxon_Agrege, "_Vir") ~ "Virus d'eukaryote",
+      str_detect(Taxon_Agrege, "_Fun") ~ "Fungi",
+      TRUE ~ "Autres"
+    )
+  )
+
+# Calcul du TRI DYNAMIQUE (Par dominance Bactérie > Virus > Fungi)
+top1_per_patient <- table_long_rpkm %>%
+  filter(Regne != "Phage") %>% 
+  group_by(Patient) %>%
+  slice_max(order_by = Log_RPKM, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(Patient, Taxon_Top1 = Taxon_Agrege, Regne_Top1 = Regne, Log_RPKM_Top1 = Log_RPKM) %>%
+  mutate(Is_Top1 = TRUE)
+
+top1_per_patient$Regne_Top1 <- factor(top1_per_patient$Regne_Top1, 
+                                      levels = c("Bactéries", "Virus d'eukaryote", "Fungi", "Autres"))
+ordre_voulu_patients <- (top1_per_patient %>% arrange(Regne_Top1, desc(Log_RPKM_Top1)))$Patient
+
+# Liste de référence des pathogènes respiratoires à mettre en gras
+pathogenes_liste <- c("Staphylococcus", "Metamycoplasma", "Acinetobacter", "Candida", 
+                      "Moraxella", "Malassezia", "Streptococcus", "Picornaviridae", "pneumoviridae", "Coronaviridae", "Pseudomonas", "Prevotella", "Corynebacterium", "Parvoviridae")
+regex_pathogenes <- paste(pathogenes_liste, collapse = "|")
+
+
+# 8.1. Barplots du Top 3 taxonomique (Mise en gras des pathogènes reconnus)
+top3_taxa_rpkm <- table_long_rpkm %>%
+  group_by(Patient) %>%
+  slice_max(order_by = Log_RPKM, n = 3, with_ties = FALSE) %>%
+  ungroup() %>%
+  # Application du gras Markdown (**) si pathogène
+  mutate(Taxon_Label = ifelse(
+      str_detect(Taxon_Agrege, regex(regex_pathogenes, ignore_case = TRUE)),
+      paste0("**", Taxon_Agrege, "**"), Taxon_Agrege
+    ))
+
+# Application du même ordre de patients que pour le Bubble Plot
+top3_taxa_rpkm$Patient <- factor(top3_taxa_rpkm$Patient, levels = ordre_voulu_patients)
+
+# Définition des couleurs unies par règne
+taxons_uniques_bar <- unique(top3_taxa_rpkm$Taxon_Label)
+mes_couleurs_bar <- c(
+  setNames(rep("#4daf4a", sum(str_detect(taxons_uniques_bar, "_Fun"))), taxons_uniques_bar[str_detect(taxons_uniques_bar, "_Fun")]),
+  setNames(rep("#377eb8", sum(str_detect(taxons_uniques_bar, "_Vir"))), taxons_uniques_bar[str_detect(taxons_uniques_bar, "_Vir")]),
+  setNames(rep("#f781bf", sum(str_detect(taxons_uniques_bar, "_Bac"))), taxons_uniques_bar[str_detect(taxons_uniques_bar, "_Bac")])
+)
+
+p_bar_horiz <- ggplot(top3_taxa_rpkm, aes(
+    x = Log_RPKM, 
+    y = reorder_within(Taxon_Label, Log_RPKM, Patient), 
+    fill = Taxon_Label
+  )) +
+  geom_col(color = "black", linewidth = 0.3, width = 0.7) + 
+  theme_bw() + 
+  scale_fill_manual(values = mes_couleurs_bar) +
+  scale_y_reordered() + 
+facet_wrap(~ Patient, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Top 3 Taxons par Patient (Abondance Absolue)",
+    subtitle = "En gras : The approved List of biological agents, Advisory Committee on Dangerous Pathogens",
+    x = "Charge estimée : Log10(RPKM + 1)",
+    y = NULL
+  ) +
+  theme(
+    strip.background = element_rect(fill = "grey20"), 
+    strip.text = element_text(color = "white", face = "bold", size = 10),
+    legend.position = "none",
+    # element_markdown lit les ** pour faire du gras
+    axis.text.y = element_markdown(size = 9, color = "black")
+  )
+
+print(p_bar_horiz)
+
+
+# 8.2. Bubble Plot de la cohorte avec clustering dynamique et Pathogènes en gras
+# Sélection : Top 5 clinique + inclusion des phages
+top5_hors_caudo <- table_long_rpkm %>% filter(Regne != "Phage") %>%
+  group_by(Patient) %>% slice_max(order_by = Log_RPKM, n = 5, with_ties = FALSE) %>% pull(Taxon_Agrege)
+liste_caudo <- table_long_rpkm %>% filter(Regne == "Phage") %>% pull(Taxon_Agrege)
+
+data_dotplot <- table_long_rpkm %>%
+  filter(Taxon_Agrege %in% unique(c(top5_hors_caudo, liste_caudo))) %>%
+  left_join(top1_per_patient %>% select(Patient, Taxon_Agrege = Taxon_Top1, Is_Top1), by = c("Patient", "Taxon_Agrege")) %>%
+  mutate(Is_Top1 = replace_na(Is_Top1, FALSE)) %>%
+  # --- NOUVEAU : Création du Label en gras pour le Bubble Plot ---
+  mutate(Taxon_Label = ifelse(
+      str_detect(Taxon_Agrege, regex(regex_pathogenes, ignore_case = TRUE)),
+      paste0("**", Taxon_Agrege, "**"), Taxon_Agrege
+  ))
+
+# Application du tri des patients
+data_dotplot$Patient <- factor(data_dotplot$Patient, levels = ordre_voulu_patients)
+
+# Tri strict de l'axe Y (Fungi -> Virus -> Phage -> Bactéries)
+data_dotplot$Regne <- factor(data_dotplot$Regne, levels = c("Fungi", "Virus d'eukaryote", "Phage", "Bactéries"))
+
+# On ordonne les labels en gras selon l'ordre des règnes pour l'axe Y
+taxons_ordonnes_label <- data_dotplot %>% 
+  distinct(Taxon_Label, Regne) %>% 
+  arrange(Regne, Taxon_Label) %>% 
+  pull(Taxon_Label)
+
+data_dotplot$Taxon_Label <- factor(data_dotplot$Taxon_Label, levels = taxons_ordonnes_label)
+
+p_bubble_final <- ggplot(data_dotplot, aes(x = Patient, y = Taxon_Label)) +
+  geom_point(aes(size = Log_RPKM, fill = Regne, color = Is_Top1, stroke = ifelse(Is_Top1, 1.5, 0.2)), shape = 21) +
+  scale_fill_manual(values = c("Bactéries" = "#f781bf", "Virus d'eukaryote" = "#377eb8", "Fungi" = "#4daf4a", "Phage" = "grey55")) +
+  scale_color_manual(values = c("TRUE" = "black", "FALSE" = "grey80"), guide = "none") + 
+  scale_size_continuous(range = c(1, 10), name = "Charge (Log10)") +
+  theme_bw() + 
+  labs(title = "Signature Microbiologique Dominante", 
+       subtitle = "Tri dynamique par cluster. En gras : Pathogènes d'intérêt clinique.", 
+       x = "Patients", y = "Taxons", fill = "Règne biologique") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "bold", size = 12), 
+        axis.text.y = element_markdown(color = "black", size = 12), 
+        legend.position = "right") +
+  guides(fill = guide_legend(override.aes = list(size = 10)))
+
+print(p_bubble_final)
+
+ggsave("Figure 2.pdf", plot = p_bubble_final, width = 14, height = 10)
+
+```
+
+# 9. ANALYSE DES ABONDANCES RELATIVES (PROPORTIONS) PAR RÈGNE ET CLUSTER
+```{r}
+
+clusters_df <- read.csv("cluster_assignments_r.csv", header = TRUE)
+
+clusters_df <- clusters_df %>%
+  rename(
+    Patient = 1,
+    cluster = 2
+  )
+    
+
+# 1. Calcul des pourcentages par patient
+df_proportion <- as.data.frame(matrice_regne) %>%
+  rownames_to_column(var = "Kingdom") %>%
+  
+  mutate(Kingdom = str_replace(Kingdom, "Eukaryota", "Fungi")) %>%
+  
+  pivot_longer(cols = -Kingdom, names_to = "Patient", values_to = "Total_RPKM") %>%
+  group_by(Patient) %>%
+  # Sécurité : si un patient est à 0 RPKM total, on met 0% pour éviter une division par zéro
+  mutate(Total_Patient = sum(Total_RPKM, na.rm = TRUE),
+         Proportion = ifelse(Total_Patient == 0, 0, (Total_RPKM / Total_Patient) * 100)) %>%
+  ungroup() %>%
+  inner_join(clusters_df, by = "Patient")
+
+# 2. Calcul des moyennes et médianes par cluster et par règne
+summary_prop <- df_proportion %>%
+  group_by(cluster, Kingdom) %>%
+  summarise(
+    Moyenne_Proportion = mean(Proportion, na.rm = TRUE),
+    Mediane_Proportion = median(Proportion, na.rm = TRUE),
+    Nb_Patients = n(),
+    .groups = "drop"
+  )
+
+print(summary_prop %>% 
+        mutate(across(c(Moyenne_Proportion, Mediane_Proportion), ~round(., 1))) %>%
+        arrange(Kingdom, cluster))
+
+# ==============================================================================
+# TESTS STATISTIQUES SUR LES PROPORTIONS (ONE-VS-ALL PAR RÈGNE)
+# ==============================================================================
+regnes_liste <- unique(df_proportion$Kingdom)
+
+for(r in regnes_liste) {
+  cat(sprintf("\n======================================================\n"))
+  cat(sprintf(">>> COMPARAISON DES PROPORTIONS : %s <<<\n", toupper(r)))
+  cat(sprintf("======================================================\n"))
+  
+  df_r <- df_proportion %>% filter(Kingdom == r)
+  
+  # Kruskal-Wallis Global
+  kw_test <- kruskal.test(Proportion ~ as.factor(cluster), data = df_r)
+  cat(sprintf("\nTest global de Kruskal-Wallis : p-value = %.4f\n", kw_test$p.value))
+  
+  # Comparaisons One-vs-All
+  res_ova <- data.frame(Comparaison = character(), p_value = numeric(), stringsAsFactors = FALSE)
+  clusters_list <- sort(unique(df_r$cluster))
+  
+  for(cl in clusters_list) {
+    in_group <- df_r$Proportion[df_r$cluster == cl]
+    out_group <- df_r$Proportion[df_r$cluster != cl]
+    
+    if(length(in_group) > 0 & length(out_group) > 0) {
+      w_test <- wilcox.test(in_group, out_group, exact = FALSE)
+      res_ova <- rbind(res_ova, data.frame(Comparaison = paste("Cluster", cl, "vs Reste"), p_value = w_test$p.value))
+    }
+  }
+  
+  if(nrow(res_ova) > 0) {
+    res_ova$p_adj_FDR <- p.adjust(res_ova$p_value, method = "BH")
+    print(res_ova %>% mutate(across(where(is.numeric), ~round(., 4))))
+  }
+}
+
+# ==============================================================================
+# VISUALISATIONS GRAPHIQUES
+# ==============================================================================
+# Si tu n'as pas ggpubr, installe-le en tapant install.packages("ggpubr") dans ta console
+library(ggpubr) 
+
+# Graphique 1 : Barplot des moyennes empilées (La vision classique Microbiote)
+p_bar_compo <- ggplot(summary_prop, aes(x = as.factor(cluster), y = Moyenne_Proportion, fill = Kingdom)) +
+  geom_bar(stat = "identity", position = "fill", color = "black", width = 0.7) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("Bacteria" = "#f781bf", "Viruses" = "#377eb8", "Fungi" = "#4daf4a")) +
+  labs(
+    title = "Composition Moyenne par Cluster",
+    subtitle = "Abondance relative (Proportion) des règnes",
+    x = "Cluster",
+    y = "Proportion Moyenne",
+    fill = "Règne"
+  ) +
+  theme_bw(base_size = 15)
+
+print(p_bar_compo)
+
+# Graphique 2 : Boxplots avec ÉTOILES DE SIGNIFICATIVITÉ
+p_box_prop <- ggplot(df_proportion, aes(x = as.factor(cluster), y = Proportion, fill = as.factor(cluster))) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 2.5, aes(color = as.factor(cluster)), alpha = 0.8) +
+  
+  # ---> L'AJOUT EST ICI : Test One-vs-All automatique avec étoiles <---
+  stat_compare_means(
+    ref.group = ".all.",        # Compare chaque cluster au reste de la cohorte
+    label = "p.signif",         # Affiche les étoiles (*, **, ***)
+    hide.ns = TRUE,             # Cache le texte "ns" pour garder le graphique propre
+    color = "darkred",          # Étoiles en rouge sombre pour bien les voir
+    size = 6,                   # Taille des étoiles
+    label.y.npc = "top"         # Place les étoiles en haut de chaque case
+  ) +
+  
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_brewer(palette = "Dark2") +
+  facet_wrap(~ Kingdom, scales = "free_y") +
+  labs(
+    title = "Distribution des Abondances Relatives (%) par Cluster",
+    subtitle = "Étoiles = Différence significative vs reste de la cohorte (Test de Wilcoxon)",
+    x = "Cluster",
+    y = "Proportion au sein du patient (%)",
+    fill = "Cluster",
+    color = "Cluster"
+  ) +
+  theme_bw(base_size = 15) +
+  theme(legend.position = "none",
+        strip.background = element_rect(fill = "grey20"),
+        strip.text = element_text(color = "white", face = "bold"))
+
+print(p_box_prop)
+
+```
+
+# 10. PROFIL COMPOSITIONNEL INDIVIDUEL (ABONDANCE RELATIVE PAR PATIENT)
+```{r}
+
+# 1. Calcul des pourcentages par patient et par catégorie
+df_prop_patient_detail <- table_long_rpkm %>%
+  group_by(Patient, Regne) %>%
+  summarise(Total_Regne = sum(RPKM, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Patient) %>%
+  mutate(
+    Total_Patient = sum(Total_Regne, na.rm = TRUE),
+    Proportion = ifelse(Total_Patient == 0, 0, (Total_Regne / Total_Patient) * 100)
+  ) %>%
+  ungroup() %>%
+  inner_join(clusters_df, by = "Patient")
+
+# 2. Ordre d'empilement des barres 
+df_prop_patient_detail$Regne <- factor(
+  df_prop_patient_detail$Regne, 
+  levels = c("Bactéries", "Virus d'eukaryote", "Phage", "Fungi", "Autres")
+)
+
+# 3. Création du graphique en barres empilées
+p_compo_patient_detail <- ggplot(df_prop_patient_detail, aes(x = Patient, y = Proportion, fill = Regne)) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.3, width = 0.8) +
+  scale_fill_manual(values = c(
+    "Bactéries" = "#f781bf", 
+    "Virus d'eukaryote" = "#377eb8", 
+    "Fungi" = "#4daf4a", 
+    "Phage" = "grey55",
+    "Autres" = "grey80"
+  )) +
+  # Séparation des patients par cluster
+  facet_grid(~ paste("Cluster", cluster), scales = "free_x", space = "free_x") +
+  labs(
+    title = "Composition Individuelle Microbienne par Patient",
+    x = "Patients",
+    y = "Abondance Relative (%)",
+    fill = "Catégorie biologique"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold", size = 12),
+    axis.text.y = element_text(size = 12),
+    strip.background = element_rect(fill = "grey20", color = "black"),
+    strip.text = element_text(color = "white", face = "bold", size = 12),
+    legend.position = "right"
+  )
+
+print(p_compo_patient_detail)
+
+# Sauvegarde du graphique
+ggsave("Composition_Individuelle_Par_Cluster.pdf", plot = p_compo_patient_detail, width = 14, height = 6)
+```
+
+
+# 11. Charge globale individuelle 
+```{r}
+library(dplyr)
+library(ggplot2)
+
+
+# 1. Calcul de l'abondance totale (RPKM) par patient
+df_rpkm_total_patient <- table_long_rpkm %>%
+  group_by(Patient) %>%
+  summarise(Total_RPKM = sum(RPKM, na.rm = TRUE), .groups = "drop") %>%
+  # Transformation Log10(RPKM + 1)
+  mutate(Log10_RPKM_plus1 = log10(Total_RPKM + 1)) %>%
+  inner_join(clusters_df, by = "Patient") %>%
+  # On crée une colonne de texte propre pour les facettes du graphique
+  mutate(Cluster_Label = paste("Cluster", cluster))
+
+# 2. CALCUL DES MÉDIANES par cluster pour pouvoir tracer les lignes
+df_medianes_cluster <- df_rpkm_total_patient %>%
+  group_by(Cluster_Label) %>%
+  summarise(Mediane_Cluster = median(Log10_RPKM_plus1, na.rm = TRUE), .groups = "drop")
+
+# 3. Création du graphique en barres simples
+p_rpkm_total_patient <- ggplot(df_rpkm_total_patient, aes(x = Patient, y = Log10_RPKM_plus1, fill = Cluster_Label)) +
+  
+  # Les barres des patients
+  geom_col(color = "black", linewidth = 0.3, width = 0.7) +
+  
+  # La ligne horizontale de la médiane
+  geom_hline(data = df_medianes_cluster, aes(yintercept = Mediane_Cluster), 
+             color = "red", linetype = "dashed", linewidth = 1) +
+  
+  # La palette de couleurs trouve maintenant une correspondance parfaite !
+  scale_fill_manual(values = c(
+    "Cluster 1" = "#e7298a",
+    "Cluster 2" = "#1b9e77", 
+    "Cluster 3" = "orange", 
+    "Cluster 4" = "steelblue"
+  )) +
+  
+  # Séparation par cluster
+  facet_grid(~ Cluster_Label, scales = "free_x", space = "free_x") +
+  
+  labs(
+    title = "Charge Microbienne Globale par Patient",
+    subtitle = "Pointillés rouges = médiane",
+    x = "Patients",
+    y = "Abondance Totale (Log10(RPKM + 1))"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold", size = 12),
+    axis.text.y = element_text(size = 12),
+    strip.background = element_rect(fill = "grey20", color = "black"),
+    strip.text = element_text(color = "white", face = "bold", size = 12),
+    legend.position = "none" # Masqué car les clusters sont déjà écrits
+  )
+
+print(p_rpkm_total_patient)
+
+# Sauvegarde du graphique
+ggsave("Abondance_Absolue_Totale_Individuelle.pdf", plot = p_rpkm_total_patient, width = 12, height = 6)
+
+```
+
+```{r}
+# ==============================================================================
+# CHARGE GLOBALE : COMPARAISONS STATISTIQUES 2 2 (BOXPLOT)
+# ==============================================================================
+library(dplyr)
+library(ggplot2)
+library(ggpubr) # Requis pour stat_compare_means
+
+cat("\n--- Génération du Boxplot avec statistiques 2 à 2 ---\n")
+
+# 1. On liste manuellement toutes les paires possibles entre tes 4 clusters
+mes_comparisons_2a2 <- list(
+  c("Cluster 1", "Cluster 2"),
+  c("Cluster 1", "Cluster 3"),
+  c("Cluster 1", "Cluster 4"),
+  c("Cluster 2", "Cluster 3"),
+  c("Cluster 2", "Cluster 4"),
+  c("Cluster 3", "Cluster 4")
+)
+
+# 2. Création du Boxplot
+p_boxplot_stats <- ggplot(df_rpkm_total_patient, aes(x = Cluster_Label, y = Log10_RPKM_plus1, fill = Cluster_Label)) +
+  
+  # Le boxplot de base
+  geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.6) +
+  
+  # Ajout des points de chaque patient
+  geom_jitter(width = 0.2, size = 2, color = "black", alpha = 0.6) +
+  
+  # Les accolades de comparaisons 2 à 2
+  stat_compare_means(
+    comparisons = mes_comparisons_2a2,
+    method = "wilcox.test",
+    p.adjust.method = "BH",    # L'AJOUT CRUCIAL POUR L'ARTICLE (FDR)
+    label = "p.signif",
+    step.increase = 0.1,
+  ) + # <--- LE FAMEUX "+" QUI MANQUAIT ÉTAIT ICI !
+  
+  # Vos couleurs habituelles
+  scale_fill_manual(values = c(
+    "Cluster 1" = "#e7298a",
+    "Cluster 2" = "#1b9e77", 
+    "Cluster 3" = "orange", 
+    "Cluster 4" = "steelblue"
+  )) +
+  
+  # On force une expansion en haut de l'axe Y pour avoir la place
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.20))) +
+  
+  labs(
+    title = "Comparaison de la Charge Microbienne Globale",
+    subtitle = "Test de Wilcoxon 2 à 2",
+    x = "Clusters",
+    y = "Abondance Totale (Log10(RPKM + 1))"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x = element_text(face = "bold", size = 12),
+    legend.position = "none" # Inutile, l'axe X donne déjà l'info
+  )
+
+print(p_boxplot_stats)
+
+# Sauvegarde
+ggsave("Abondance_Absolue_Boxplot_Stats_2a2.pdf", plot = p_boxplot_stats, width = 8, height = 7)
+
+
+```

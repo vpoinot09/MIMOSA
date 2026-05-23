@@ -1,0 +1,186 @@
+---
+title: "Traitement des données RNA-Seq Humain : Normalisation TPM et Extraction de
+  la signature Inflammatoire"
+output:
+  html_document: default
+  pdf_document: default
+date: "2026-04-10"
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r message=FALSE, warning=FALSE}
+# PIPELINE DE TRAITEMENT MÉTATRANSCRIPTOMIQUE (HÔTE)
+# Étapes : Normalisation TPM, Annotation HGNC, Filtrage de prévalence, 
+# Transformation Log2 et Extraction des gènes de réponse immunitaire (GO:0006952)
+
+# Chargement des bibliothèques nécessaires
+library(dplyr)
+library(tibble)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+
+# 1.1. Matrice des comptes bruts (gènes codants)
+counts_bruts <- read.table("counts_mimosa_human.txt", header = TRUE, sep = "\t", row.names = 1, check.names = FALSE)
+
+# 1.2. Fichier de référence des longueurs de transcrits
+gene_lengths <- read.table("ma_reference.txt", header = TRUE, sep = "\t", quote = "", fill = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+colnames(gene_lengths) <- c("ensembl_gene_id", "hgnc_symbol", "transcript_length")
+
+# 1.3. Dictionnaire d'annotation principal (identifiants Ensembl vers Symboles)
+annotations <- read.csv("counts_human_WITH_NAMES.csv")
+
+```
+
+# 2. NORMALISATION EN TPM (Transcripts Per Million)
+```{r}
+
+noms_complets <- colnames(counts_bruts)
+
+# 2.1. Préparation des longueurs de gènes : conversion en kilobases (kb)
+# En cas de transcrits multiples pour un même gène, la longueur maximale est conservée
+gene_lengths_clean <- gene_lengths %>%
+  mutate(transcript_length = as.numeric(transcript_length)) %>%
+  filter(!is.na(transcript_length)) %>%
+  mutate(length_kb = transcript_length / 1000) %>%
+  group_by(ensembl_gene_id) %>%
+  summarise(length_kb = max(length_kb, na.rm = TRUE), .groups = "drop")
+
+# 2.2. Jointure de la matrice de comptes avec les longueurs de gènes
+matrice_prep <- as.data.frame(counts_bruts) %>%
+  rownames_to_column("ensembl_id") %>%
+  mutate(ensembl_gene_id = gsub("\\..*$", "", ensembl_id)) %>%
+  inner_join(gene_lengths_clean, by = "ensembl_gene_id")
+
+counts_num <- matrice_prep %>% dplyr::select(all_of(noms_complets))
+
+# 2.3. Calcul du RPK (Reads Per Kilobase) : normalisation par la longueur du gène
+rpk <- counts_num / matrice_prep$length_kb
+
+# 2.4. Calcul du facteur de mise à l'échelle (par million de RPK)
+facteur_million <- colSums(rpk, na.rm = TRUE) / 1e6
+
+# 2.5. Calcul final du TPM : normalisation par la profondeur de séquençage
+matrice_tpm_valeurs <- sweep(rpk, MARGIN = 2, STATS = facteur_million, FUN = "/")
+
+```
+
+# 3. ANNOTATION DES GÈNES (Conversion Ensembl ID vers HGNC Symbol)
+
+```{r}
+
+# Création d'un dictionnaire de secours pour les gènes absents de l'annotation principale
+dico_secours <- gene_lengths %>% 
+  dplyr::select(ensembl_gene_id, hgnc_symbol) %>% 
+  filter(hgnc_symbol != "") %>%
+  group_by(ensembl_gene_id) %>% 
+  summarise(hgnc_symbol = hgnc_symbol[1], .groups = "drop")
+
+# Annotation de la matrice TPM
+matrice_tpm_annotee <- as.data.frame(matrice_tpm_valeurs) %>%
+  mutate(ENSEMBL = matrice_prep$ensembl_gene_id) %>%
+  # Tentative 1 : Annotation via le fichier CSV fourni
+  left_join(annotations, by = "ENSEMBL") %>%
+  # Tentative 2 : Annotation via le dictionnaire de secours
+  left_join(dico_secours, by = c("ENSEMBL" = "ensembl_gene_id")) %>%
+  # Résolution : priorité au symbole du CSV, sinon utilisation du dictionnaire de secours
+  mutate(Gene = coalesce(SYMBOL, hgnc_symbol)) %>%
+  filter(!is.na(Gene) & Gene != "") %>%
+  dplyr::select(Gene, all_of(noms_complets)) %>%
+  # Agrégation des comptes pour les gènes ayant le même symbole (duplicatas)
+  group_by(Gene) %>%
+  summarise(across(everything(), sum), .groups = "drop") %>%
+  column_to_rownames("Gene")
+
+write.table(matrice_tpm_annotee, "TPM_humain_avant_filtre.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+
+```
+
+# 4. FILTRAGE QUALITATIF (Échantillons et Prévalence)
+
+```{r}
+
+# 4.1. Exclusion des échantillons contrôles ou non pertinents pour l'analyse
+exclude <- c("HE", "JM", "NT1", "NT2", "Nt2bis")
+matrice_sans_exclus <- matrice_tpm_annotee[, !(colnames(matrice_tpm_annotee) %in% exclude)]
+
+# 4.2. Filtre de prévalence : conservation des gènes exprimés (TPM > 0) 
+# chez au moins 25% de la cohorte restante
+seuil_patients <- 0.25 * ncol(matrice_sans_exclus)
+matrice_filtree_25 <- matrice_sans_exclus[rowSums(matrice_sans_exclus > 0) > seuil_patients, ]
+
+cat("-> Gènes conservés après filtrage :", nrow(matrice_filtree_25), "\n")
+
+```
+
+# 5. TRANSFORMATION LOG2 ET EXPORTATION MATRICE GLOBALE
+
+```{r}
+
+# La transformation Log2(x + 1) permet de normaliser la distribution des données 
+# et de gérer les valeurs nulles.
+matrice_globale_log2tpm <- log2(matrice_filtree_25 + 1)
+
+write.table(matrice_globale_log2tpm, "Matrice_GLOBALE_Filtree_0.25_log2TPM.txt", sep="\t", quote=FALSE, col.names=NA)
+
+```
+
+# 6. EXTRACTION DE LA SIGNATURE INFLAMMATOIRE / DÉFENSE (GO:0006952)
+
+```{r}
+
+# Récupération des gènes associés au terme "Defense Response" (GO:0006952)
+go_genes <- AnnotationDbi::select(org.Hs.eg.db, 
+                                  keys = "GO:0006952", 
+                                  columns = c("ENSEMBL", "SYMBOL"), 
+                                  keytype = "GOALL")
+
+# Nettoyage et extraction d'une liste unique de symboles géniques
+go_genes_clean <- go_genes[!is.na(go_genes$ENSEMBL) & !is.na(go_genes$SYMBOL), ]
+inflam_symbols_list <- unique(go_genes_clean$SYMBOL)
+defense_ensembl_list <- unique(go_genes_clean$ENSEMBL)
+
+# Sous-échantillonnage de la matrice globale Log2(TPM+1)
+matrice_inflammatoire_log2tpm <- as.data.frame(matrice_globale_log2tpm) %>%
+  rownames_to_column("Gene") %>%
+  filter(Gene %in% inflam_symbols_list) %>%
+  column_to_rownames("Gene")
+
+cat("-> Gènes de l'inflammation conservés :", nrow(matrice_inflammatoire_log2tpm), "\n")
+
+write.table(matrice_inflammatoire_log2tpm, "Matrice_INFLAMMATION_Filtree_0.25_log2TPM.txt", sep="\t", quote=FALSE, col.names=NA)
+
+```
+
+# 7. PRÉPARATION DES COMPTES BRUTS POUR L'ANALYSE D'EXPRESSION DIFFÉRENTIELLE
+
+```{r}
+
+# Retrait des échantillons exclus
+patients_a_garder <- setdiff(colnames(counts_bruts), exclude)
+counts_bruts_sansHEJM <- counts_bruts %>%
+  dplyr::select(all_of(patients_a_garder))
+
+write.table(counts_bruts_sansHEJM, "Matrice_ALL_Comptes_Bruts.txt", sep="\t", quote=FALSE, col.names=NA)
+
+cat("Filtrage de la matrice brute pour les gènes de défense...\n")
+
+# Filtrage dynamique des comptes bruts basé sur les identifiants Ensembl
+counts_bruts_defense_all <- as.data.frame(counts_bruts) %>%
+  rownames_to_column("ensembl_id_full") %>%
+  # Suppression de la version du transcrit (ex: ENSG000001.14 -> ENSG000001)
+  mutate(ENSEMBL = gsub("\\..*$", "", ensembl_id_full)) %>%
+  # Sélection exclusive des gènes de réponse de défense (liste générée à l'étape 6)
+  filter(ENSEMBL %in% defense_ensembl_list) %>%
+  dplyr::select(ENSEMBL, all_of(patients_a_garder)) %>%
+  # Agrégation des potentiels duplicatas d'Ensembl
+  group_by(ENSEMBL) %>%
+  summarise(across(everything(), sum), .groups = "drop") %>%
+  column_to_rownames("ENSEMBL")
+
+cat("-> Matrice générée :", nrow(counts_bruts_defense_all), "gènes et", ncol(counts_bruts_defense_all), "échantillons.\n")
+
+write.table(counts_bruts_defense_all, "Matrice_INFLAMMATION_Comptes_Bruts.txt", sep="\t", quote=FALSE, col.names=NA)
+
+```

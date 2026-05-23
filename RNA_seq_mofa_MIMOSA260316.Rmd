@@ -1,0 +1,424 @@
+---
+title: "Intégration Multi-Omique : MOFA2"
+output: html_document
+date: "2026-04-29"
+editor_options: 
+  chunk_output_type: console
+---
+
+Objectif : Fusionner les matrices transcriptomiques humaines et métagénomiques,
+standardiser les distributions (Z-score), et formater les données en liste longue 
+(format requis par la fonction create_mofa() du package MOFA2).
+
+```{r, setup, include=FALSE}
+
+library(tidyverse)
+
+```
+
+# 1.DEFINITION DES FICHIERS D'ENTREE
+```{r message=FALSE, warning=FALSE}
+
+cat("1. Définition des matrices à intégrer...\n")
+
+# A. Matrices issues du pipeline Microbiote (Abondance, Diversité, Dominance)
+files_microbiome <- c(
+  "Matrice_Regne_Patient_Log2.txt", 
+  "Matrice_Richness_OTU_vs_Taxo.txt", 
+  "Matrice_Shannon_OTU_vs_Taxo.txt", 
+  "Matrice_Abondance_Dominants_Regne.txt", 
+  "Matrice_Globale_Log2_Prev5.txt"
+)
+
+# B. Matrice issue du pipeline Humain (Signature Inflammatoire)
+file_human <- "Matrice_INFLAMMATION_Filtree_0.25_log2TPM.txt"
+
+# Initialisation d'une liste globale pour conserver les valeurs brutes (non centrées-réduites)
+raw_matrices_list <- list()
+
+```
+
+# 2.FONCTION DE NORMALISATION ET DE FORMATAGE 
+```{r}
+
+# Rationale : Le modèle MOFA repose sur l'analyse de la variance. Il nécessite 
+# que les "features" (gènes, taxons) soient à la même échelle. On applique donc 
+# une transformation Z-score par ligne (moyenne = 0, écart-type = 1).
+# Ensuite, la matrice est pivotée en format "long", structure imposée par MOFA.
+
+process_matrix <- function(filename, view_name) {
+  cat("-> Traitement de la matrice :", filename, "\n")
+  
+  # Lecture de la matrice (Lignes = Features, Colonnes = Patients)
+  mat <- read.table(filename, header = TRUE, row.names = 1, sep = "\t", check.names = FALSE)
+  
+  # Sauvegarde de la version transposée brute dans l'environnement global (<<-)
+  # (Utile pour des corrélations cliniques ultérieures hors-MOFA)
+  raw_matrices_list[[filename]] <<- t(mat)
+  
+  # Standardisation Z-score (centrage et réduction par "Feature")
+  mat_z <- t(apply(mat, 1, function(x) {
+    # Sécurité : Si la variance est nulle (valeur constante), on centre uniquement 
+    # pour éviter une division par zéro (NaN).
+    if(sd(x, na.rm = TRUE) == 0) return(x - mean(x, na.rm = TRUE)) 
+    scale(x)
+  }))
+  colnames(mat_z) <- colnames(mat)
+  
+  # Pivot en format long (Feature, Sample, Value, View)
+  df_long <- as.data.frame(mat_z) %>%
+    rownames_to_column(var = "feature") %>%
+    pivot_longer(cols = -feature, names_to = "sample", values_to = "value") %>%
+    mutate(view = view_name)
+  
+  return(df_long)
+}
+
+```
+
+# 3.CHARGEMENT ET TRAITEMENT DES MODALITES (VUES)
+```{r message=FALSE, warning=FALSE}
+
+cat("2. Application de la standardisation...\n")
+
+all_data_list <- list()
+
+# A. Intégration des données du Microbiote
+for(f in files_microbiome) {
+  if(file.exists(f)) {
+    all_data_list[[f]] <- process_matrix(f, "microbiome")
+  } else {
+    warning(paste("Fichier introuvable :", f))
+  }
+}
+
+# B. Intégration des données Transcriptomiques Humaines
+if(file.exists(file_human)) {
+  all_data_list[[file_human]] <- process_matrix(file_human, "human")
+} else {
+  warning(paste("Fichier humain introuvable :", file_human))
+}
+
+```
+
+
+# 4.EXPORT DE LA MATRICE COMPLETE BRUTE CONSOLIDEE
+```{r}
+# Rationale : Bien que MOFA utilise les données centrées-réduites, il est crucial 
+# de générer une "Master Matrix" contenant les vraies valeurs (Log2) de toutes 
+# les variables (humaines et microbiennes) pour les futures analyses descriptives.
+
+cat("3. Consolidation de la matrice brute globale...\n")
+
+# Formatage des éléments de la liste pour garantir la présence de la clé de jointure "sample"
+list_of_dfs <- lapply(raw_matrices_list, function(x) {
+  df <- as.data.frame(x)
+  if (!"sample" %in% colnames(df)) {
+    df <- rownames_to_column(df, var = "sample")
+  }
+  return(df)
+})
+
+# Fusion récursive (full_join) de toutes les matrices par Patient (sample)
+full_raw_matrix <- list_of_dfs %>% 
+  purrr::reduce(dplyr::full_join, by = "sample")
+
+cat("-> Dimension de la matrice consolidée :", nrow(full_raw_matrix), "patients et", ncol(full_raw_matrix)-1, "variables.\n")
+write.table(full_raw_matrix, "matrice_complete_brute.txt", sep="\t", quote=FALSE, row.names = FALSE)
+
+```
+
+
+# 5. DEFINITION FINALE DES VUES MOFA ET EXPORT DU TABLEAU LONG
+```{r}
+
+# Rationale : L'essence de MOFA est de séparer les variables en "Vues" biologiques.
+# Le modèle va chercher les facteurs latents qui expliquent la variance à l'intérieur 
+# d'une vue, mais surtout la co-variance ENTRE les vues (ex: Interactions Virus/Hôte).
+
+cat("4. Attribution des Views biologiques et finalisation...\n")
+
+# Assemblage vertical de toutes les matrices longues
+dt <- bind_rows(all_data_list)
+
+# Reclassification chirurgicale des Vues par expressions régulières (Regex)
+dt <- dt %>%
+  mutate(view = case_when(
+    # 1. Le Transcriptome de l'Hôte
+    view == "human" ~ "Human_Inflammation", 
+    
+    # 2. La Taxonomie Microbienne (Résolution maximale)
+    str_detect(feature, "Bac") ~ "Bacteria",
+    str_detect(feature, "Euk") ~ "Eukaryota",
+    str_detect(feature, "Vir") ~ "Viruses",
+    
+    # 3. Les Métriques Globales (Richesse, Shannon, Dominance, Charges par Règne)
+    TRUE ~ "Microbiome_Global" 
+  )) %>%
+  dplyr::select(sample, feature, value, view)
+
+cat("\n--- Bilan de l'objet de données MOFA ('dt') ---\n")
+cat("Nombre total d'observations (lignes) :", nrow(dt), "\n\n")
+cat("Répartition des variables par Vue :\n")
+print(table(dt$view))
+
+# Exportation de l'objet final pour l'entraînement du modèle MOFA en Python/R
+write.table(dt, "dt.txt", sep="\t", row.names = FALSE, quote = FALSE)
+cat("\n✅ Le tableau 'dt.txt' est prêt à être importé dans create_mofa() !\n")
+
+```
+
+
+# 6. EXTRACION DU MODELE MOFA2 ET FORMATAGE DES FACTEURS LATENTS
+```{r}
+
+# Rationale : Le modèle MOFA pré-entraîné (HDF5) contient les "Facteurs Latents". 
+# Ces facteurs résument les principales sources de variance partagée entre l'expression génique de l'hôte et la composition du microbiote.
+
+library(MOFA2)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+
+cat("1. Chargement du modèle MOFA et extraction des facteurs...\n")
+
+# Chargement du modèle pré-entraîné
+MOFAobject <- load_model("model_MIMOSA.hdf5")
+
+# Extraction des facteurs latents sous forme de dataframe
+df_factors <- get_factors(MOFAobject, as.data.frame = TRUE) %>% 
+  dplyr::select(-group)
+
+# Pivot au format large (Patients en lignes, Facteurs en colonnes)
+umap_dim <- df_factors %>%
+  pivot_wider(names_from = factor, values_from = value) %>%
+  as.data.frame()
+
+rownames(umap_dim) <- umap_dim$sample
+
+```
+
+
+# 7. REDUCTION DE DIMENSIONNALITE (UMAP) ET CLUSTERING NON SUPERVISE 
+```{r}
+# Rationale : L'UMAP projette les facteurs multidimensionnels de MOFA dans un 
+# espace en 2D. Le K-means identifie ensuite objectivement les phénotypes.
+
+
+cat("2. Calcul de l'UMAP et du Clustering...\n")
+
+# Calcul de l'UMAP via MOFA
+umap <- run_umap(MOFAobject, n_neighbors = 2, min_dist = 0, n_components = 10, verbose = FALSE)
+umap_dim <- as.data.frame(umap@dim_red[["UMAP"]])
+
+# Lancement du K-means
+clust <- kmeans(umap_dim[-1], centers = 4, nstart = 5)
+cluster <- as.data.frame(clust$cluster)
+colnames(cluster)[1] <- "cluster"
+
+# Sauvegarde des assignations de clusters
+write.csv(cluster, "cluster_assignments_r1.csv") 
+
+cluster <- read.csv("cluster_assignments_r.csv", header = TRUE, row.names = 1)
+
+# Fusion des données pour le graphique
+umap_dim_merge <- merge(umap_dim, cluster, by = "row.names")
+rownames(umap_dim_merge) <- umap_dim_merge$Row.names
+umap_dim_merge <- subset(umap_dim_merge, select = -1)
+
+```
+
+# 8. VISUALISATION DES CLUSTERS EN 2D
+
+```{r, fig.width=14, fig.height=14}
+
+cat("3. Génération de la projection UMAP...\n")
+
+# Création du graphique avec les paramètres exacts d'origine
+p_umap <- ggplot(umap_dim_merge, aes(x = UMAP1, y = UMAP2)) + 
+  
+  stat_ellipse(aes(fill = as.character(cluster)), geom = "polygon", size = 2, alpha = 0.3) +
+  geom_point(size = 3, aes(colour = as.character(cluster))) +
+  
+  scale_fill_brewer(palette = "Dark2") +
+  scale_colour_brewer(palette = "Dark2") +
+  
+  labs(
+    title = "Clusters des Métatranscriptomes Respiratoires",
+    x = "Dimension UMAP 1",
+    y = "Dimension UMAP 2",
+    fill = "Clusters",
+    colour = "Clusters"
+  ) +
+  
+  theme_bw(base_size = 20) +
+  geom_label_repel(aes(label = rownames(umap_dim_merge)), size = 3)
+
+print(p_umap)
+
+```
+
+CARACTERISATION STATISTIQUE DES CLUSTERS (BIOMARQUEURS)
+```{r warning=FALSE}
+# Rationale : Cette fonction sur-mesure compare chaque cluster au reste de la cohorte
+# (approche One-vs-All). Elle utilise le test non-paramétrique de Wilcoxon (adapté 
+# aux données omiques ne suivant pas une loi normale), calcule la taille d'effet 
+# (Cliff's Delta) et applique une correction FDR (Benjamini-Hochberg) pour le 
+# problème des tests multiples.
+
+library(effsize)
+
+cat("4. Lancement de l'analyse statistique des biomarqueurs...\n")
+
+# 1. On récupère les coordonnées UMAP et on s'assure qu'il n'y a qu'une seule colonne 'sample'
+umap_plot_df <- as.data.frame(umap@dim_red[["UMAP"]])
+if (!"sample" %in% colnames(umap_plot_df)) {
+  umap_plot_df$sample <- rownames(umap_plot_df)
+}
+
+# 2. On prépare les clusters de la même manière
+cluster_df_clean <- read.csv("cluster_assignments_r.csv", header = TRUE, row.names = 1)
+cluster_df_clean$sample <- rownames(cluster_df_clean)
+
+# 3. Fusion UMAP + CLUSTERS (en ne gardant qu'une fois chaque colonne)
+# On utilise select(-any_of(...)) pour éviter les doublons de colonnes avant de fusionner
+umap_combined <- umap_plot_df %>%
+  left_join(cluster_df_clean, by = "sample")
+
+# 4. Chargement de la matrice brute
+metadata_full <- read.table("matrice_complete_brute.txt", header = TRUE, sep = "\t", check.names = FALSE)
+
+# On force le nom de la première colonne (souvent 'sample' ou 'Row.names')
+colnames(metadata_full)[1] <- "sample"
+
+# 5. FUSION FINALE : On fusionne tout par 'sample'
+metadata_merged <- umap_combined %>% 
+  left_join(metadata_full, by = "sample")
+
+# Sauvegarde de la table fusionnée
+write.table(metadata_merged, "metadata_r2.txt", sep = "\t", row.names = FALSE)
+
+# Import pour l'analyse
+filecoinf <- read.table("metadata_r2.txt", header = TRUE, row.names = 1, check.names = FALSE)
+continuous_vars <- colnames(filecoinf)[6:ncol(filecoinf)]
+
+compute_all_features <- function(data, cluster_col, continuous_vars, qualitative_vars = NULL) {
+    clusters <- unique(data[[cluster_col]])
+    results_list <- list()
+    
+    # --- 1. Variables Continues (Tests Non-Paramétriques) ---
+    if (!is.null(continuous_vars) && length(continuous_vars) > 0) {
+        for (var in continuous_vars) {
+            for (cl in clusters) {
+                data_ref <- na.omit(data[data[[cluster_col]] == cl, var])
+                data_others <- na.omit(data[data[[cluster_col]] != cl, var])
+                data_global <- na.omit(data[[var]])
+                
+                if (length(data_ref) > 1 & length(data_others) > 1) {
+                    test_res <- wilcox.test(data_ref, data_others, exact = FALSE)
+                    eff <- cliff.delta(data_ref, data_others)$estimate
+                    med_ref <- median(data_ref)
+                    med_others <- median(data_others)
+                    direction <- ifelse(med_ref > med_others, "higher", "lower")
+                    z_score <- (mean(data_ref) - mean(data_global)) / sd(data_global)
+                } else {
+                    test_res <- list(p.value = NA); eff <- NA; direction <- NA; z_score <- NA; med_ref <- NA; med_others <- NA
+                }
+                
+                results_list[[length(results_list) + 1]] <- data.frame(
+                    variable = var, type = "continuous", cluster = cl,
+                    p_value = test_res$p.value, effect_size = eff,
+                    direction = direction, value_cluster = med_ref,
+                    value_others = med_others, z_score = z_score
+                )
+            }
+        }
+    }
+    
+    # --- 2. Variables Qualitatives (Tests de Fisher) ---
+    if (!is.null(qualitative_vars) && length(qualitative_vars) > 0) {
+        for (var in qualitative_vars) {
+            for (cl in clusters) {
+                tab <- table(data[[var]], data[[cluster_col]] == cl)
+                if (all(dim(tab) >= 2)) {
+                    test_res <- fisher.test(tab)
+                    prop_cluster <- prop.table(tab, 2)[, "TRUE"]
+                    max_cat <- names(which.max(prop_cluster))
+                    direction <- paste0("over:", max_cat)
+                    effect <- test_res$estimate 
+                } else {
+                    test_res <- list(p.value = NA); effect <- NA; direction <- NA
+                }
+                
+                results_list[[length(results_list) + 1]] <- data.frame(
+                    variable = var, type = "categorical", cluster = cl,
+                    p_value = test_res$p.value, effect_size = effect,
+                    direction = direction, value_cluster = NA,
+                    value_others = NA, z_score = NA
+                )
+            }
+        }
+    }
+    
+    if (length(results_list) == 0) return(NULL)
+    results <- bind_rows(results_list)
+    
+    # --- 3. Correction des Tests Multiples (FDR) ---
+    results <- results %>%
+        group_by(variable) %>%
+        mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+        ungroup()
+    
+    return(results)
+}
+
+# Exécution de la fonction sur toutes les variables omiques
+results_all <- compute_all_features(
+    data = filecoinf,
+    cluster_col = "cluster",
+    continuous_vars = continuous_vars
+)
+
+write.table(results_all, "results_all.tsv", sep = "\t", row.names = FALSE)
+cat("✅ Analyse statistique terminée ! Fichier 'results_all.tsv' généré.\n")
+
+```
+
+
+# 11. SYNTHÈSE DES BIOMARQUEURS MICROBIENS PAR CLUSTER
+```{r, fig.width=14, fig.height=14}
+library(dplyr)
+library(knitr)
+
+# 1. On récupère le dictionnaire des vues (pour identifier le microbiome)
+dict_vues <- dt %>% 
+  distinct(feature, view) %>% 
+  rename(variable = feature)
+
+# 2. Préparation du tableau filtré
+# On part de results_all, on ajoute la vue, et on filtre
+tableau_markdown <- results_all %>%
+  left_join(dict_vues, by = "variable") %>%
+  
+  # Filtre : On garde uniquement le microbiome
+  filter(view != "Human_Inflammation") %>%
+  
+  # Filtre de robustesse (pour ne pas afficher 500 lignes inutiles)
+  filter(abs(effect_size) > 0.5 & p_adj < 0.2) %>%
+  
+  # On sélectionne les colonnes demandées dans l'ordre
+  select(variable, cluster, p_value, p_adj, effect_size) %>%
+  
+  # On trie par cluster pour la lisibilité
+  arrange(cluster, p_adj)
+
+# 3. Affichage du tableau formaté pour le Markdown
+kable(
+  tableau_markdown, 
+  col.names = c("Variable Microbiote", "Cluster", "p-value", "p-adj (FDR)", "Effect Size"),
+  digits = 4, 
+  caption = "Tableau des biomarqueurs microbiens significatifs par cluster (|Effect Size| > 0.5 et FDR < 0.2)"
+)
+
+```
